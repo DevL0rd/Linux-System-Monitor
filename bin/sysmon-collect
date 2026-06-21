@@ -13,7 +13,7 @@ swap, and NVIDIA GPU (util, VRAM, temp, power, clocks, fan).
 
 Modes: --serve | --snapshot | --once
 """
-import os, re, sys, json, time, glob, socket, shutil, subprocess
+import os, re, sys, json, time, glob, socket
 
 APP = "Linux-System-Monitor"
 RUNDIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), APP)
@@ -162,37 +162,45 @@ def read_mem():
 
 
 # ---------------------------------------------------------------- gpu (nvidia)
-GPU_FIELDS = ["name", "utilization.gpu", "memory.used", "memory.total",
-              "temperature.gpu", "power.draw", "clocks.gr", "clocks.mem", "fan.speed"]
+_nvml = {"init": False, "h": None}
 
 
 def read_gpu():
-    exe = shutil.which("nvidia-smi")
-    if not exe:
-        return None
+    """Overall GPU stats via NVML -- no fork, ~4ms. None if there's no NVIDIA
+    GPU / NVML present (the widget then hides the GPU card)."""
     try:
-        out = subprocess.run(
-            [exe, "--query-gpu=" + ",".join(GPU_FIELDS), "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=6).stdout.strip()
+        import pynvml as N
     except Exception:
         return None
-    if not out:
-        return None
-    c = [x.strip() for x in out.splitlines()[0].split(",")]
+    try:
+        if not _nvml["init"]:
+            N.nvmlInit()
+            _nvml["h"] = N.nvmlDeviceGetHandleByIndex(0)
+            _nvml["init"] = True
+        h = _nvml["h"]
+        name = N.nvmlDeviceGetName(h)
+        if isinstance(name, bytes):
+            name = name.decode("utf-8", "ignore")
+        mem = N.nvmlDeviceGetMemoryInfo(h)
 
-    def num(i):
-        try:
-            return float(c[i])
-        except (ValueError, IndexError):
-            return 0
-    vu, vt = num(2) * 1048576, num(3) * 1048576          # MiB -> bytes
-    return {
-        "name": c[0] if c else "GPU",
-        "util": num(1), "vram_used": vu, "vram_total": vt,
-        "vram_pct": (vu / vt * 100) if vt else 0,
-        "temp": round(num(4)), "power": num(5),
-        "clock_gr": num(6), "clock_mem": num(7), "fan": num(8),
-    }
+        def _try(fn, *a):
+            try:
+                return fn(h, *a)
+            except N.NVMLError:
+                return 0
+        return {
+            "name": name,
+            "util": N.nvmlDeviceGetUtilizationRates(h).gpu,
+            "vram_used": mem.used, "vram_total": mem.total,
+            "vram_pct": (mem.used / mem.total * 100) if mem.total else 0,
+            "temp": _try(N.nvmlDeviceGetTemperature, N.NVML_TEMPERATURE_GPU),
+            "power": _try(N.nvmlDeviceGetPowerUsage) / 1000.0,
+            "clock_gr": _try(N.nvmlDeviceGetClockInfo, N.NVML_CLOCK_GRAPHICS),
+            "clock_mem": _try(N.nvmlDeviceGetClockInfo, N.NVML_CLOCK_MEM),
+            "fan": _try(N.nvmlDeviceGetFanSpeed),
+        }
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------- build
