@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""
+Linux-System-Monitor :: resident system collector.
+
+A single `--serve` daemon (systemd --user service, pinned to the E-cores) reads
+/proc + /sys + nvidia-smi once per interval and writes a snapshot to
+$XDG_RUNTIME_DIR/Linux-System-Monitor/data.json. The widget reads it in-process
+via XHR (no per-poll process spawn).
+
+Collected: total + per-core CPU% (split into P-cores / E-cores on Intel hybrid),
+per-group average frequency, package power (Intel RAPL), CPU temperature, RAM +
+swap, and NVIDIA GPU (util, VRAM, temp, power, clocks, fan).
+
+Modes: --serve | --snapshot | --once
+"""
+import os, re, sys, json, time, glob, socket, shutil, subprocess
+
+APP = "Linux-System-Monitor"
+RUNDIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), APP)
+DATA = os.path.join(RUNDIR, "data.json")
+CONFIG = os.path.expanduser(f"~/.config/{APP}/config.json")
+
+
+def load_config():
+    try:
+        with open(CONFIG) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------- cpu topology
+def _cpu_list(path):
+    try:
+        s = open(path).read().strip()
+    except OSError:
+        return []
+    out = []
+    for part in s.split(","):
+        if "-" in part:
+            a, b = part.split("-"); out += list(range(int(a), int(b) + 1))
+        elif part:
+            out.append(int(part))
+    return out
+
+
+P_CPUS = _cpu_list("/sys/devices/cpu_core/cpus")     # Intel hybrid P-core threads
+E_CPUS = _cpu_list("/sys/devices/cpu_atom/cpus")     # Intel hybrid E-core threads
+HYBRID = bool(P_CPUS and E_CPUS)
+
+CPU_MODEL = ""
+try:
+    for ln in open("/proc/cpuinfo"):
+        if ln.startswith("model name"):
+            CPU_MODEL = ln.split(":", 1)[1].strip(); break
+except OSError:
+    pass
+
+
+# ---------------------------------------------------------------- cpu usage
+def read_stat():
+    out = {}
+    for ln in open("/proc/stat"):
+        if not ln.startswith("cpu"):
+            break
+        p = ln.split()
+        name = p[0]
+        if name != "cpu" and not name[3:].isdigit():
+            continue
+        v = list(map(int, p[1:]))
+        idle = v[3] + (v[4] if len(v) > 4 else 0)        # idle + iowait
+        out[name] = (idle, sum(v))
+    return out
+
+
+def cpu_freqs():
+    """logical cpu index -> current MHz."""
+    f = {}
+    for path in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq"):
+        try:
+            n = int(re.search(r"cpu(\d+)", path).group(1))
+            f[n] = int(open(path).read()) / 1000.0
+        except (OSError, ValueError, AttributeError):
+            pass
+    return f
+
+
+def cpu_temp():
+    best = 0
+    for hw in glob.glob("/sys/class/hwmon/hwmon*"):
+        try:
+            name = open(os.path.join(hw, "name")).read().strip()
+        except OSError:
+            continue
+        if name in ("coretemp", "k10temp", "zenpower"):
+            for ti in glob.glob(os.path.join(hw, "temp*_input")):
+                try:
+                    best = max(best, int(open(ti).read()) / 1000.0)
+                except (OSError, ValueError):
+                    pass
+    return round(best)
+
+
+# ---------------------------------------------------------------- rapl power
+def _rapl_paths():
+    for d in glob.glob("/sys/class/powercap/intel-rapl:*"):
+        try:
+            if open(os.path.join(d, "name")).read().strip() == "package-0":
+                return os.path.join(d, "energy_uj"), os.path.join(d, "max_energy_range_uj")
+        except OSError:
+            pass
+    return None, None
+
+
+RAPL_ENERGY, RAPL_MAX = _rapl_paths()
+
+
+def rapl_energy():
+    try:
+        return int(open(RAPL_ENERGY).read())
+    except (OSError, TypeError):
+        return None
+
+
+# ---------------------------------------------------------------- memory
+def read_mem():
+    m = {}
+    for ln in open("/proc/meminfo"):
+        k, _, v = ln.partition(":")
+        m[k] = int(v.strip().split()[0]) * 1024          # kB -> bytes
+    total = m.get("MemTotal", 0)
+    avail = m.get("MemAvailable", 0)
+    used = max(0, total - avail)
+    swt = m.get("SwapTotal", 0)
+    swf = m.get("SwapFree", 0)
+    swu = max(0, swt - swf)
+    return {
+        "total": total, "used": used, "pct": (used / total * 100) if total else 0,
+        "swap_total": swt, "swap_used": swu,
+        "swap_pct": (swu / swt * 100) if swt else 0,
+    }
+
+
+# ---------------------------------------------------------------- gpu (nvidia)
+GPU_FIELDS = ["name", "utilization.gpu", "memory.used", "memory.total",
+              "temperature.gpu", "power.draw", "clocks.gr", "clocks.mem", "fan.speed"]
+
+
+def read_gpu():
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return None
+    try:
+        out = subprocess.run(
+            [exe, "--query-gpu=" + ",".join(GPU_FIELDS), "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=6).stdout.strip()
+    except Exception:
+        return None
+    if not out:
+        return None
+    c = [x.strip() for x in out.splitlines()[0].split(",")]
+
+    def num(i):
+        try:
+            return float(c[i])
+        except (ValueError, IndexError):
+            return 0
+    vu, vt = num(2) * 1048576, num(3) * 1048576          # MiB -> bytes
+    return {
+        "name": c[0] if c else "GPU",
+        "util": num(1), "vram_used": vu, "vram_total": vt,
+        "vram_pct": (vu / vt * 100) if vt else 0,
+        "temp": round(num(4)), "power": num(5),
+        "clock_gr": num(6), "clock_mem": num(7), "fan": num(8),
+    }
+
+
+# ---------------------------------------------------------------- build
+_prev = {"stat": {}, "energy": None, "when": None}
+
+
+def _usage(name, prev, cur):
+    if name not in prev or name not in cur:
+        return 0.0
+    pi, pt = prev[name]
+    ci, ct = cur[name]
+    dt = ct - pt
+    if dt <= 0:
+        return 0.0
+    return max(0.0, min(100.0, (1.0 - (ci - pi) / dt) * 100.0))
+
+
+def _avg(xs):
+    return round(sum(xs) / len(xs), 1) if xs else 0.0
+
+
+def build():
+    now = time.time()
+    stat = read_stat()
+    freqs = cpu_freqs()
+    prev = _prev["stat"]
+
+    total = round(_usage("cpu", prev, stat), 1)
+    ncpu = sum(1 for k in stat if k != "cpu")
+    per = {n: round(_usage("cpu%d" % n, prev, stat), 1) for n in range(ncpu)}
+
+    cpu = {"total": total, "hybrid": HYBRID, "temp": cpu_temp()}
+    if HYBRID:
+        cpu["p"] = [per.get(n, 0) for n in P_CPUS]
+        cpu["e"] = [per.get(n, 0) for n in E_CPUS]
+        cpu["p_total"] = _avg(cpu["p"])
+        cpu["e_total"] = _avg(cpu["e"])
+        cpu["p_freq"] = round(_avg([freqs.get(n, 0) for n in P_CPUS]) / 1000.0, 2)
+        cpu["e_freq"] = round(_avg([freqs.get(n, 0) for n in E_CPUS]) / 1000.0, 2)
+    else:
+        cpu["cores"] = [per.get(n, 0) for n in range(ncpu)]
+    cpu["freq"] = round(_avg(list(freqs.values())) / 1000.0, 2)
+
+    # RAPL package watts
+    energy = rapl_energy()
+    dt = (now - _prev["when"]) if _prev["when"] else 0
+    if energy is not None and _prev["energy"] is not None and dt > 0:
+        de = energy - _prev["energy"]
+        if de < 0:                                       # counter wrapped
+            try:
+                de += int(open(RAPL_MAX).read())
+            except (OSError, TypeError):
+                de = 0
+        cpu["watts"] = round(de / 1e6 / dt, 1)
+    else:
+        cpu["watts"] = 0
+
+    _prev["stat"] = stat
+    _prev["energy"] = energy
+    _prev["when"] = now
+
+    try:
+        uptime = float(open("/proc/uptime").read().split()[0])
+    except OSError:
+        uptime = 0
+    try:
+        load = [float(x) for x in open("/proc/loadavg").read().split()[:3]]
+    except OSError:
+        load = [0, 0, 0]
+
+    return {
+        "ts": now, "host": socket.gethostname(), "cpu_model": CPU_MODEL,
+        "uptime": uptime, "load": load, "ncpu": ncpu,
+        "cpu": cpu, "mem": read_mem(), "gpu": read_gpu(),
+    }
+
+
+# ---------------------------------------------------------------- modes
+def write_snapshot(snap):
+    os.makedirs(RUNDIR, exist_ok=True)
+    tmp = DATA + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(snap, f)
+    os.replace(tmp, DATA)
+
+
+def cmd_serve():
+    build()
+    time.sleep(0.5)
+    write_snapshot(build())
+    while True:
+        interval = float(load_config().get("poll_interval", 2))
+        time.sleep(max(0.5, interval))
+        try:
+            write_snapshot(build())
+        except Exception as e:
+            sys.stderr.write(f"sysmon-collect: {e}\n")
+
+
+def cmd_once():
+    build()
+    time.sleep(0.4)
+    json.dump(build(), sys.stdout, indent=2)
+    sys.stdout.write("\n")
+
+
+def cmd_snapshot():
+    try:
+        sys.stdout.write(open(DATA).read())
+    except Exception:
+        sys.stdout.write('{"ts":0,"cpu":{},"mem":{},"gpu":null}')
+
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else "--once"
+    return {"--serve": cmd_serve, "--snapshot": cmd_snapshot,
+            "--once": cmd_once}.get(arg, cmd_once)()
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
