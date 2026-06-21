@@ -5,6 +5,7 @@
  */
 import QtQuick
 import org.kde.kirigami as Kirigami
+import "Ring.js" as Ring
 
 Item {
     id: root
@@ -19,6 +20,7 @@ Item {
     property bool paused: false        // when true, stop advancing the history
     property var tipText: function(value, index, total) { return "" + value }
 
+    property var _ring: Ring.make(maxHistory)   // remade if maxHistory changes
     property var _vals: []
 
     Sparkline {
@@ -36,11 +38,8 @@ Item {
         repeat: true
         running: !root.paused
         onTriggered: {
-            var a = root._vals.slice()
-            a.push(root.value)
-            if (a.length > root.maxHistory)
-                a.shift()
-            root._vals = a
+            Ring.push(root._ring, root.value)       // O(1), no shift/realloc
+            root._vals = Ring.values(root._ring)
         }
     }
 }
