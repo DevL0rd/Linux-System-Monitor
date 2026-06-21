@@ -27,6 +27,7 @@ PlasmoidItem {
     Connections {
         target: Plasmoid.configuration
         function onPanelIconChanged() { root.panelIcon = Plasmoid.configuration.panelIcon || "cpu" }
+        function onUpdateIntervalChanged() { root.applyInterval() }
     }
 
     readonly property color accent: Plasmoid.configuration.accentColor !== ""
@@ -77,7 +78,21 @@ PlasmoidItem {
         repeat: true; running: true
         onTriggered: root.read()
     }
-    Component.onCompleted: pathHelper.connectSource("printf %s \"$XDG_RUNTIME_DIR/Linux-System-Monitor/data.json\"")
+    // keep the collector's sample rate in lock-step with the refresh interval, so
+    // changing the setting speeds the *data* up immediately (not just the re-read)
+    P5Support.DataSource {
+        id: cfgWriter
+        engine: "executable"
+        onNewData: function(source, d) { disconnectSource(source) }
+    }
+    function applyInterval() {
+        cfgWriter.connectSource("$HOME/.local/bin/sysmon-collect --set-interval "
+            + (Math.max(500, Plasmoid.configuration.updateInterval) / 1000))
+    }
+    Component.onCompleted: {
+        pathHelper.connectSource("printf %s \"$XDG_RUNTIME_DIR/Linux-System-Monitor/data.json\"")
+        applyInterval()
+    }
 
     // ---------------------------------------------------------------- helpers
     component StatTile: ColumnLayout {
