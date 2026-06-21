@@ -190,9 +190,10 @@ PlasmoidItem {
         }
         RowLayout {
             Layout.fillWidth: true
-            StatTile { tlabel: i18n("Freq"); tvalue: (root.cpu.freq || 0).toFixed(1) + " GHz" }
-            StatTile { tlabel: i18n("Power"); tvalue: Math.round(root.cpu.watts || 0) + " W" }
             StatTile { tlabel: i18n("Temp"); tvalue: Fmt.temp(root.cpu.temp); tcolor: Fmt.heat(root.cpu.temp || 0, 80, 95, Kirigami.Theme) }
+            StatTile { tlabel: i18n("Clock"); tvalue: (root.cpu.freq || 0).toFixed(1) + " GHz" }
+            StatTile { tlabel: i18n("Power"); tvalue: Math.round(root.cpu.watts || 0) + " W" }
+            StatTile { tlabel: i18n("Fan"); tvalue: (root.cpu.fan === undefined || root.cpu.fan === null) ? "—" : root.cpu.fan + " RPM" }
         }
     }
 
@@ -225,6 +226,18 @@ PlasmoidItem {
 
     component MemCard: Card {
         title: i18n("Memory")
+        trailing: Math.round(root.mem.pct || 0) + "%"
+        trailingColor: Fmt.heat(root.mem.pct || 0, 75, 90, Kirigami.Theme)
+        HistoryChart {
+            visible: Plasmoid.configuration.showCharts
+            Layout.fillWidth: true
+            Layout.preferredHeight: Kirigami.Units.gridUnit * 3
+            value: root.mem.pct || 0
+            rangeMax: 100
+            lineColor: root.accent
+            sampleInterval: Math.max(500, Plasmoid.configuration.updateInterval)
+            tipText: function(v) { return Math.round(v) + "% RAM" }
+        }
         Gauge {
             Layout.fillWidth: true
             label: i18n("RAM")
@@ -267,8 +280,8 @@ PlasmoidItem {
         RowLayout {
             Layout.fillWidth: true
             StatTile { tlabel: i18n("Temp"); tvalue: Fmt.temp(root.gpu ? root.gpu.temp : 0); tcolor: Fmt.heat(root.gpu ? root.gpu.temp : 0, 75, 88, Kirigami.Theme) }
-            StatTile { tlabel: i18n("Power"); tvalue: Math.round(root.gpu ? root.gpu.power : 0) + " W" }
             StatTile { tlabel: i18n("Clock"); tvalue: Math.round(root.gpu ? root.gpu.clock_gr : 0) + " MHz" }
+            StatTile { tlabel: i18n("Power"); tvalue: Math.round(root.gpu ? root.gpu.power : 0) + " W" }
             StatTile { tlabel: i18n("Fan"); tvalue: Math.round(root.gpu ? root.gpu.fan : 0) + "%" }
         }
     }
@@ -322,10 +335,10 @@ PlasmoidItem {
                 ColumnLayout {
                     width: scroll.availableWidth
                     spacing: Kirigami.Units.smallSpacing
+                    GpuCard {}
                     CpuCard {}
                     CoresCard {}
                     MemCard {}
-                    GpuCard {}
                     Item { Layout.fillHeight: true }
                 }
             }

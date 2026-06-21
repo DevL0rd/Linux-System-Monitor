@@ -121,6 +121,19 @@ def cpu_temp():
     return round(sum(cores) / len(cores)) if cores else 0
 
 
+def cpu_fan():
+    """RPM of a fan whose hwmon label contains 'cpu' (generic, any board/laptop).
+    None when no such sensor exists."""
+    for hw in glob.glob("/sys/class/hwmon/hwmon*"):
+        for fi in glob.glob(os.path.join(hw, "fan*_input")):
+            try:
+                if "cpu" in open(fi[:-6] + "_label").read().strip().lower():
+                    return int(open(fi).read())
+            except (OSError, ValueError):
+                continue
+    return None
+
+
 # ---------------------------------------------------------------- rapl power
 def _rapl_paths():
     for d in glob.glob("/sys/class/powercap/intel-rapl:*"):
@@ -243,6 +256,7 @@ def build():
     else:
         cpu["cores"] = [per.get(n, 0) for n in range(ncpu)]
     cpu["freq"] = round(_avg(list(freqs.values())) / 1000.0, 2)
+    cpu["fan"] = cpu_fan()
 
     # RAPL package watts
     energy = rapl_energy()
