@@ -134,6 +134,52 @@ def cpu_fan():
     return None
 
 
+# ---- static hardware ceilings: graph full-scale, auto-detected once at start
+# (the widget uses these as defaults, overridable in its settings)
+def _cpu_clock_max():
+    mx = 0
+    for f in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq"):
+        try:
+            mx = max(mx, int(open(f).read()))
+        except (OSError, ValueError):
+            pass
+    return round(mx / 1e6, 2)                            # kHz -> GHz
+
+
+def _cpu_power_max():
+    for d in glob.glob("/sys/class/powercap/intel-rapl:*"):
+        try:
+            if open(os.path.join(d, "name")).read().strip() != "package-0":
+                continue
+        except OSError:
+            continue
+        mx = 0
+        for c in glob.glob(os.path.join(d, "constraint_*_max_power_uw")):
+            try:
+                mx = max(mx, int(open(c).read()))
+            except (OSError, ValueError):
+                continue
+        if mx > 0:
+            return round(mx / 1e6)                       # uW -> W
+    return 0
+
+
+def _cpu_fan_max():
+    for hw in glob.glob("/sys/class/hwmon/hwmon*"):
+        for fi in glob.glob(os.path.join(hw, "fan*_input")):
+            try:
+                if "cpu" in open(fi[:-6] + "_label").read().strip().lower():
+                    return int(open(fi[:-6] + "_max").read())
+            except (OSError, ValueError):
+                continue
+    return 0
+
+
+CPU_CLOCK_MAX = _cpu_clock_max()
+CPU_POWER_MAX = _cpu_power_max()
+CPU_FAN_MAX = _cpu_fan_max()
+
+
 # ---------------------------------------------------------------- rapl power
 def _rapl_paths():
     for d in glob.glob("/sys/class/powercap/intel-rapl:*"):
@@ -201,6 +247,18 @@ def read_gpu():
                 return fn(h, *a)
             except N.NVMLError:
                 return 0
+        if "clock_max" not in _nvml:                     # static ceilings, cache once
+            _nvml["clock_max"] = _try(N.nvmlDeviceGetMaxClockInfo, N.NVML_CLOCK_GRAPHICS)
+            _nvml["power_max"] = 0                        # not all GPUs expose every getter
+            for _pg in (N.nvmlDeviceGetEnforcedPowerLimit,
+                        N.nvmlDeviceGetPowerManagementLimit,
+                        N.nvmlDeviceGetPowerManagementDefaultLimit):
+                try:
+                    _nvml["power_max"] = round(_pg(h) / 1000.0)
+                    if _nvml["power_max"]:
+                        break
+                except N.NVMLError:
+                    continue
         return {
             "name": name,
             "util": N.nvmlDeviceGetUtilizationRates(h).gpu,
@@ -211,6 +269,8 @@ def read_gpu():
             "clock_gr": _try(N.nvmlDeviceGetClockInfo, N.NVML_CLOCK_GRAPHICS),
             "clock_mem": _try(N.nvmlDeviceGetClockInfo, N.NVML_CLOCK_MEM),
             "fan": _try(N.nvmlDeviceGetFanSpeed),
+            "clock_max": _nvml.get("clock_max", 0),       # graph full-scale (MHz)
+            "power_max": _nvml.get("power_max", 0),        # graph full-scale (W)
         }
     except Exception:
         return None
@@ -257,6 +317,9 @@ def build():
         cpu["cores"] = [per.get(n, 0) for n in range(ncpu)]
     cpu["freq"] = round(_avg(list(freqs.values())) / 1000.0, 2)
     cpu["fan"] = cpu_fan()
+    cpu["clock_max"] = CPU_CLOCK_MAX                      # graph full-scale (GHz)
+    cpu["power_max"] = CPU_POWER_MAX                      # graph full-scale (W)
+    cpu["fan_max"] = CPU_FAN_MAX                          # graph full-scale (RPM; 0 = unknown)
 
     # RAPL package watts
     energy = rapl_energy()

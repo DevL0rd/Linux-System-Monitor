@@ -11,6 +11,12 @@ Kirigami.FormLayout {
     property alias cfg_showCharts: chartsCheck.checked
     property alias cfg_showPerCore: coresCheck.checked
     property alias cfg_showGpu: gpuCheck.checked
+    property alias cfg_cpuClockMax: cpuClock.value
+    property alias cfg_cpuPowerMax: cpuPower.value
+    property alias cfg_cpuFanMax: cpuFan.value
+    property alias cfg_gpuClockMax: gpuClock.value
+    property alias cfg_gpuPowerMax: gpuPower.value
+    property alias cfg_gpuFanMax: gpuFan.value
 
     RowLayout {
         Kirigami.FormData.label: i18n("Panel icon:")
@@ -24,6 +30,32 @@ Kirigami.FormLayout {
     QQC2.CheckBox { id: chartsCheck; Kirigami.FormData.label: i18n("Show:"); text: i18n("History graphs") }
     QQC2.CheckBox { id: coresCheck; text: i18n("Per-core bars") }
     QQC2.CheckBox { id: gpuCheck; text: i18n("GPU section") }
+
+    Item { Kirigami.FormData.isSection: true }
+
+    QQC2.Label {
+        Kirigami.FormData.label: i18n("Graph full-scale:")
+        text: i18n("0 = auto-detect from hardware")
+        opacity: 0.6
+    }
+    RowLayout {
+        Kirigami.FormData.label: i18n("CPU clock / power / fan:")
+        QQC2.SpinBox { id: cpuClock; from: 0; to: 12; stepSize: 1 }
+        QQC2.Label { text: i18n("GHz"); opacity: 0.6 }
+        QQC2.SpinBox { id: cpuPower; from: 0; to: 1000; stepSize: 5 }
+        QQC2.Label { text: i18n("W"); opacity: 0.6 }
+        QQC2.SpinBox { id: cpuFan; from: 0; to: 20000; stepSize: 100 }
+        QQC2.Label { text: i18n("RPM"); opacity: 0.6 }
+    }
+    RowLayout {
+        Kirigami.FormData.label: i18n("GPU clock / power / fan:")
+        QQC2.SpinBox { id: gpuClock; from: 0; to: 6000; stepSize: 50 }
+        QQC2.Label { text: i18n("MHz"); opacity: 0.6 }
+        QQC2.SpinBox { id: gpuPower; from: 0; to: 1000; stepSize: 5 }
+        QQC2.Label { text: i18n("W"); opacity: 0.6 }
+        QQC2.SpinBox { id: gpuFan; from: 0; to: 100; stepSize: 5 }
+        QQC2.Label { text: i18n("%"); opacity: 0.6 }
+    }
 
     Item { Kirigami.FormData.isSection: true }
 

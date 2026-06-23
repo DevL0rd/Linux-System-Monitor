@@ -17,6 +17,7 @@ import org.kde.plasma.plasmoid
 import org.kde.plasma.plasma5support as P5Support
 import "lib"
 import "lib/Format.js" as Fmt
+import "lib/Ring.js" as Ring
 
 PlasmoidItem {
     id: root
@@ -69,14 +70,16 @@ PlasmoidItem {
         xhr.onreadystatechange = function() {
             if (xhr.readyState !== XMLHttpRequest.DONE) return
             if (!xhr.responseText) return
-            try { root.snap = JSON.parse(xhr.responseText) } catch (e) {}
+            try { root.snap = JSON.parse(xhr.responseText); root.recordHistory() } catch (e) {}
         }
         xhr.send()
     }
-    Timer {
-        interval: Math.max(500, Plasmoid.configuration.updateInterval)
-        repeat: true; running: true
-        onTriggered: root.read()
+    // event-driven: re-read the instant the collector rewrites the snapshot (no
+    // polling). The collector's sample rate (updateInterval, applied below) sets
+    // how often that happens.
+    FileWatcher {
+        path: root.cachePath
+        onChanged: root.read()
     }
     // keep the collector's sample rate in lock-step with the refresh interval, so
     // changing the setting speeds the *data* up immediately (not just the re-read)
@@ -94,21 +97,141 @@ PlasmoidItem {
         applyInterval()
     }
 
-    // ---------------------------------------------------------------- helpers
-    component StatTile: ColumnLayout {
-        id: tile
-        property string tlabel: ""
-        property string tvalue: ""
-        property color tcolor: Kirigami.Theme.textColor
-        Layout.fillWidth: true
-        spacing: 0
-        PlasmaComponents.Label {
-            Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter
-            text: tile.tlabel; font: Kirigami.Theme.smallFont; opacity: 0.55
+    // ---------------------------------------------------------------- history
+    // Every metric (not just the charted one) is recorded continuously into a ring
+    // buffer the moment a snapshot arrives -- so switching tabs shows full history
+    // immediately. Modelled on Process Monitor: O(1) pushes for all metrics, but
+    // only the tab currently on screen is linearised + repainted (the rest just
+    // accumulate numbers and cost nothing until selected). `histTick` bumps once
+    // per sample to nudge the visible chart to re-read its ring.
+    readonly property int histLen: 120
+    property int histTick: 0
+    property var hist: ({ cpu: {}, gpu: {}, mem: {} })
+
+    // per-device metric descriptors: key (ring id), label (tab), max (chart range,
+    // 0 = auto-scale), get (pull current value from the live cpu/gpu object), fmt
+    // (format a value for the tab + tooltip). Order = tab order, Usage first.
+    // max(src): graph full-scale -- user override (config) if set, else the
+    // hardware ceiling the collector detected, else a sane fallback. color(v):
+    // heat tint for the value (usage/temp only; others read as plain text).
+    readonly property var cpuMetrics: [
+        { key: "usage", label: i18n("Usage"), get: function(c) { return c.total || 0 }, fmt: function(v) { return Math.round(v) + "%" },
+          max: function(c) { return 100 }, color: function(v) { return Fmt.heat(v, 60, 85, Kirigami.Theme) } },
+        { key: "temp",  label: i18n("Temp"),  get: function(c) { return c.temp || 0 },  fmt: function(v) { return Math.round(v) + "°C" },
+          max: function(c) { return 100 }, color: function(v) { return Fmt.heat(v, 80, 95, Kirigami.Theme) } },
+        { key: "clock", label: i18n("Clock"), get: function(c) { return c.freq || 0 },  fmt: function(v) { return v.toFixed(1) + " GHz" },
+          max: function(c) { return Plasmoid.configuration.cpuClockMax > 0 ? Plasmoid.configuration.cpuClockMax : (c.clock_max || 6) } },
+        { key: "power", label: i18n("Power"), get: function(c) { return c.watts || 0 }, fmt: function(v) { return Math.round(v) + " W" },
+          max: function(c) { return Plasmoid.configuration.cpuPowerMax > 0 ? Plasmoid.configuration.cpuPowerMax : (c.power_max || 100) } },
+        { key: "fan",   label: i18n("Fan"),   get: function(c) { return c.fan || 0 },   fmt: function(v) { return v > 0 ? Math.round(v) + " RPM" : "—" },
+          max: function(c) { return Plasmoid.configuration.cpuFanMax > 0 ? Plasmoid.configuration.cpuFanMax : (c.fan_max || 6000) } }
+    ]
+    readonly property var gpuMetrics: [
+        { key: "usage", label: i18n("Usage"), get: function(g) { return g.util || 0 },     fmt: function(v) { return Math.round(v) + "%" },
+          max: function(g) { return 100 }, color: function(v) { return Fmt.heat(v, 60, 85, Kirigami.Theme) } },
+        { key: "temp",  label: i18n("Temp"),  get: function(g) { return g.temp || 0 },     fmt: function(v) { return Math.round(v) + "°C" },
+          max: function(g) { return 100 }, color: function(v) { return Fmt.heat(v, 75, 88, Kirigami.Theme) } },
+        { key: "clock", label: i18n("Clock"), get: function(g) { return g.clock_gr || 0 }, fmt: function(v) { return Math.round(v) + " MHz" },
+          max: function(g) { return Plasmoid.configuration.gpuClockMax > 0 ? Plasmoid.configuration.gpuClockMax : (g.clock_max || 3000) } },
+        { key: "power", label: i18n("Power"), get: function(g) { return g.power || 0 },    fmt: function(v) { return Math.round(v) + " W" },
+          max: function(g) { return Plasmoid.configuration.gpuPowerMax > 0 ? Plasmoid.configuration.gpuPowerMax : (g.power_max || 175) } },
+        { key: "fan",   label: i18n("Fan"),   get: function(g) { return g.fan || 0 },      fmt: function(v) { return Math.round(v) + "%" },
+          max: function(g) { return Plasmoid.configuration.gpuFanMax > 0 ? Plasmoid.configuration.gpuFanMax : 100 } }
+    ]
+    readonly property var memMetrics: [
+        { key: "usage", label: i18n("RAM"), get: function(m) { return m.pct || 0 }, fmt: function(v) { return Math.round(v) + "%" },
+          max: function(m) { return 100 }, color: function(v) { return Fmt.heat(v, 75, 90, Kirigami.Theme) } }
+    ]
+
+    function recordDevice(dev, src, defs) {
+        var h = hist[dev]
+        for (var i = 0; i < defs.length; i++) {
+            var k = defs[i].key
+            var r = h[k] || (h[k] = Ring.make(histLen))
+            Ring.push(r, defs[i].get(src))
         }
-        PlasmaComponents.Label {
-            Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter
-            text: tile.tvalue; color: tile.tcolor; font.weight: Font.DemiBold
+    }
+    function recordHistory() {
+        recordDevice("cpu", root.cpu, cpuMetrics)
+        recordDevice("mem", root.mem, memMetrics)
+        if (root.gpu) recordDevice("gpu", root.gpu, gpuMetrics)
+        histTick++                                   // notify the visible chart(s)
+    }
+    // oldest->newest array for one metric's ring (only called for the on-screen tab)
+    function histValues(dev, key) {
+        var h = hist[dev], r = h && h[key]
+        return r ? Ring.values(r) : []
+    }
+
+    // ---------------------------------------------------------------- helpers
+    // A history graph with a row of metric tabs beneath it. Every metric is already
+    // being recorded centrally (recordHistory), so clicking a tab just rebinds the
+    // graph to that metric's ring and its full history appears instantly. Tabs are
+    // equal width (fillWidth + equal preferredWidth) so they stay evenly spaced.
+    component TabbedChart: ColumnLayout {
+        id: tc
+        property string device: "cpu"
+        property var metrics: []
+        property var source: ({})              // live cpu/gpu object (for tab values)
+        property int selected: 0
+        readonly property var sel: tc.metrics[tc.selected] || ({})
+        Layout.fillWidth: true
+        spacing: Kirigami.Units.smallSpacing
+
+        Sparkline {
+            visible: Plasmoid.configuration.showCharts
+            Layout.fillWidth: true
+            Layout.preferredHeight: Kirigami.Units.gridUnit * 3
+            // re-read the selected ring each sample (histTick) and on tab change;
+            // only this one metric is linearised -- the others just keep recording
+            values: { root.histTick; return root.histValues(tc.device, tc.sel.key || "usage") }
+            rangeMax: tc.sel.max ? tc.sel.max(tc.source) : 0    // hard fixed full-scale per metric
+            lineColor: root.accent
+            tipText: function(v) { return tc.sel.fmt ? tc.sel.fmt(v) : Math.round(v) + "" }
+        }
+
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: Kirigami.Units.smallSpacing
+            Repeater {
+                model: tc.metrics
+                delegate: Rectangle {
+                    id: tab
+                    required property int index
+                    required property var modelData
+                    readonly property bool current: tab.index === tc.selected
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 1                        // equal-width columns
+                    Layout.preferredHeight: tabCol.implicitHeight + Kirigami.Units.smallSpacing
+                    radius: Kirigami.Units.smallSpacing
+                    color: tab.current ? Qt.alpha(root.accent, 0.18)
+                         : tabHover.hovered ? Qt.alpha(Kirigami.Theme.textColor, 0.07)
+                         : "transparent"
+                    Behavior on color { ColorAnimation { duration: 120 } }
+                    ColumnLayout {
+                        id: tabCol
+                        anchors.centerIn: parent
+                        width: parent.width - Kirigami.Units.smallSpacing
+                        spacing: 0
+                        PlasmaComponents.Label {
+                            Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter
+                            text: tab.modelData.label; font: Kirigami.Theme.smallFont
+                            opacity: tab.current ? 0.9 : 0.55; elide: Text.ElideRight
+                        }
+                        PlasmaComponents.Label {
+                            Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter
+                            text: tab.modelData.fmt(tab.modelData.get(tc.source))
+                            // heat-coded where the metric defines it (usage/temp); else
+                            // accent when selected, plain otherwise
+                            color: tab.modelData.color ? tab.modelData.color(tab.modelData.get(tc.source))
+                                 : (tab.current ? root.accent : Kirigami.Theme.textColor)
+                            font.weight: Font.DemiBold; elide: Text.ElideRight
+                        }
+                    }
+                    HoverHandler { id: tabHover }
+                    TapHandler { onTapped: tc.selected = tab.index }
+                }
+            }
         }
     }
 
@@ -176,24 +299,14 @@ PlasmoidItem {
     // ---------------------------------------------------------------- cards
     component CpuCard: Card {
         title: i18n("CPU")
-        trailing: Math.round(root.cpu.total || 0) + "%"
-        trailingColor: Fmt.heat(root.cpu.total || 0, 60, 85, Kirigami.Theme)
-        HistoryChart {
-            visible: Plasmoid.configuration.showCharts
-            Layout.fillWidth: true
-            Layout.preferredHeight: Kirigami.Units.gridUnit * 3
-            value: root.cpu.total || 0
-            rangeMax: 100
-            lineColor: root.accent
-            sampleInterval: Math.max(500, Plasmoid.configuration.updateInterval)
-            tipText: function(v) { return Math.round(v) + "% CPU" }
-        }
-        RowLayout {
-            Layout.fillWidth: true
-            StatTile { tlabel: i18n("Temp"); tvalue: Fmt.temp(root.cpu.temp); tcolor: Fmt.heat(root.cpu.temp || 0, 80, 95, Kirigami.Theme) }
-            StatTile { tlabel: i18n("Clock"); tvalue: (root.cpu.freq || 0).toFixed(1) + " GHz" }
-            StatTile { tlabel: i18n("Power"); tvalue: Math.round(root.cpu.watts || 0) + " W" }
-            StatTile { tlabel: i18n("Fan"); tvalue: (root.cpu.fan === undefined || root.cpu.fan === null) ? "—" : root.cpu.fan + " RPM" }
+        // top-right reflects the selected tab's current value, color-coded
+        trailing: cpuTabs.sel.fmt ? cpuTabs.sel.fmt(cpuTabs.sel.get(root.cpu)) : ""
+        trailingColor: cpuTabs.sel.color ? cpuTabs.sel.color(cpuTabs.sel.get(root.cpu)) : Kirigami.Theme.textColor
+        TabbedChart {
+            id: cpuTabs
+            device: "cpu"
+            metrics: root.cpuMetrics
+            source: root.cpu
         }
     }
 
@@ -228,14 +341,13 @@ PlasmoidItem {
         title: i18n("Memory")
         trailing: Math.round(root.mem.pct || 0) + "%"
         trailingColor: Fmt.heat(root.mem.pct || 0, 75, 90, Kirigami.Theme)
-        HistoryChart {
+        Sparkline {
             visible: Plasmoid.configuration.showCharts
             Layout.fillWidth: true
             Layout.preferredHeight: Kirigami.Units.gridUnit * 3
-            value: root.mem.pct || 0
+            values: { root.histTick; return root.histValues("mem", "usage") }
             rangeMax: 100
             lineColor: root.accent
-            sampleInterval: Math.max(500, Plasmoid.configuration.updateInterval)
             tipText: function(v) { return Math.round(v) + "% RAM" }
         }
         Gauge {
@@ -258,17 +370,13 @@ PlasmoidItem {
     component GpuCard: Card {
         visible: Plasmoid.configuration.showGpu && root.gpu
         title: root.gpu ? root.gpuShort(root.gpu.name) : i18n("GPU")
-        trailing: root.gpu ? Math.round(root.gpu.util) + "%" : ""
-        trailingColor: Fmt.heat(root.gpu ? root.gpu.util : 0, 60, 85, Kirigami.Theme)
-        HistoryChart {
-            visible: Plasmoid.configuration.showCharts
-            Layout.fillWidth: true
-            Layout.preferredHeight: Kirigami.Units.gridUnit * 3
-            value: root.gpu ? root.gpu.util : 0
-            rangeMax: 100
-            lineColor: root.accent
-            sampleInterval: Math.max(500, Plasmoid.configuration.updateInterval)
-            tipText: function(v) { return Math.round(v) + "% GPU" }
+        trailing: (root.gpu && gpuTabs.sel.fmt) ? gpuTabs.sel.fmt(gpuTabs.sel.get(root.gpu)) : ""
+        trailingColor: (root.gpu && gpuTabs.sel.color) ? gpuTabs.sel.color(gpuTabs.sel.get(root.gpu)) : Kirigami.Theme.textColor
+        TabbedChart {
+            id: gpuTabs
+            device: "gpu"
+            metrics: root.gpuMetrics
+            source: root.gpu || ({})
         }
         Gauge {
             Layout.fillWidth: true
@@ -276,13 +384,6 @@ PlasmoidItem {
             value: root.gpu ? root.gpu.vram_pct : 0
             valueText: root.gpu ? (root.fmtGB(root.gpu.vram_used) + " / " + root.fmtGB(root.gpu.vram_total)) : ""
             barColor: root.accent
-        }
-        RowLayout {
-            Layout.fillWidth: true
-            StatTile { tlabel: i18n("Temp"); tvalue: Fmt.temp(root.gpu ? root.gpu.temp : 0); tcolor: Fmt.heat(root.gpu ? root.gpu.temp : 0, 75, 88, Kirigami.Theme) }
-            StatTile { tlabel: i18n("Clock"); tvalue: Math.round(root.gpu ? root.gpu.clock_gr : 0) + " MHz" }
-            StatTile { tlabel: i18n("Power"); tvalue: Math.round(root.gpu ? root.gpu.power : 0) + " W" }
-            StatTile { tlabel: i18n("Fan"); tvalue: Math.round(root.gpu ? root.gpu.fan : 0) + "%" }
         }
     }
 
