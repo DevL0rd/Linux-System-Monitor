@@ -10,3 +10,6 @@ __pycache__/
 .idea/
 *.swp
 .DS_Store
+
+# Shared QML/JS components synced from the shared/common submodule by install.sh
+plasmoids/*/contents/ui/lib/

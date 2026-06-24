@@ -21,8 +21,13 @@ in-process via `file://` XHR (needs `QML_XHR_ALLOW_FILE_READ=1`, set by
 
 ## Install
 
+Clone **with submodules** — the shared QML/JS components live in the
+[Linux-Plasma-Shared](https://github.com/DevL0rd/Linux-Plasma-Shared) submodule:
+
 ```sh
+git clone --recurse-submodules https://github.com/DevL0rd/Linux-System-Monitor.git
 cd Linux-System-Monitor
+# already cloned without it?  git submodule update --init --recursive
 ./install.sh
 ```
 
